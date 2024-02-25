@@ -22,6 +22,7 @@ import shutil
 
 VERSION_BYTES = __version__.encode('utf-8')
 ENCRYPTEDHEADER = b"$sasecli:2.0:"
+ENCRYPTEDHEADER_LEN = len(ENCRYPTEDHEADER)
 CONFIGHEADER_UNIX = b"---\ntype: sasecli\nversion: " + VERSION_BYTES + b"\n"
 CONFIGHEADER_WINDOWS = b"---\r\ntype: sasecli\r\nversion: " + VERSION_BYTES + b"\r\n"
 CONFIG_DIR = '.sasecli'
@@ -61,9 +62,9 @@ def check_get_file(file):
         first_line = file_handle.readline()
         file_data = file_handle.read()
 
-    if first_line[0:11] == ENCRYPTEDHEADER[0:11]:
+    if first_line[0:ENCRYPTEDHEADER_LEN] == ENCRYPTEDHEADER[0:ENCRYPTEDHEADER_LEN]:
         # get salt (end of first line until newline)
-        salt = first_line[11:-1]
+        salt = first_line[ENCRYPTEDHEADER_LEN:-1]
         return True, salt, file_data
     else:
         return False, b'', b''

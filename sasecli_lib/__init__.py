@@ -46,9 +46,8 @@ ESCAPE_CHAR = '\N{INFORMATION SEPARATOR THREE}'
 
 ELEMENTS_ID2N = {}
 ELEMENTS_N2ID = {}
-CLIENT_N2ID = {}
-CLIENT_CANONICAL_N2ID = {}
-CLIENT_ID2R = {}
+TSG_N2ID = {}
+TSG_ID2N = {}
 OPERATORS_ID2N = {}
 
 CONNECTING_ELEMENT_ID = {}
@@ -96,6 +95,7 @@ def quiet_tracebacks(exception_type, exception, traceback):
     sys.stderr.flush()
 
 
+# -- Begin monkeypatch for prisma_sase SDK
 # New function for Prisma SASE SDK - don't need scope in JWT request, but SDK currently requires it.
 # This should be removed once Prisma SASE SDK patches this.
 def monkeypatch_generate_jwt(self):
@@ -166,7 +166,7 @@ def monkeypatch_generate_jwt(self):
 
 
 def monkeypatch_interactive_login_secret(self, client_id=None, client_secret=None, tsg_id=None, grant_type=None,
-                                         scope=None, prompt=None):
+                                         scope=None):
     """
     Interactive login using the `prisma_sase.API` object. This function is more robust and handles SAML and MSP accounts.
     Expects interactive capability. if this is not available, use `prisma_sase.API.post.login` directly.
@@ -266,6 +266,73 @@ def monkeypatch_interactive_login_secret(self, client_id=None, client_secret=Non
         self.client_secret = None
 
     return False
+
+
+def monkeypatch_get_tsg(self, params=None, api_version="v1"):
+    """
+    Get all tenant service groups
+    """
+
+    cur_ctlr = self.controller
+
+    if not params:
+        url = str(cur_ctlr) + "/tenancy/{}/tenant_service_groups".format(api_version)
+    else:
+        url = str(cur_ctlr) + "/tenancy/{}/tenant_service_groups?".format(api_version, params)
+
+    prisma_sase.api_logger.debug("URL = %s", url)
+    return self.rest_call(url, "get")
+
+
+def monkeypatch_toolkit_session(self, element_id, tenant_id=None, api_version="v2.0", cols=207, rows=53, **kwargs):
+
+    if tenant_id is None and self.tenant_id:
+        # Pull tenant_id from parent namespace cache.
+        tenant_id = self.tenant_id
+
+    # set controller, converting protocol to wss
+    wss_ctlr = self.controller.replace('https://', 'wss://', 1)
+
+    url = str(wss_ctlr) + "/sdwan/{}/api/elements/{}/ws/toolkitsessions?cols={}&rows={}" \
+                          "".format(api_version, element_id, cols, rows)
+
+    prisma_sase.api_logger.debug("URL = %s", url)
+    return self.websocket_call(url, **kwargs)
+
+
+def monkeypatch_default_ws(self, tenant_id=None, api_version="v2.0", **kwargs):
+
+    if tenant_id is None and self.tenant_id:
+        # Pull tenant_id from parent namespace cache.
+        tenant_id = self.tenant_id
+
+    # set controller, converting protocol to wss
+    wss_ctlr = self.controller.replace('https://', 'wss://', 1)
+
+    url = str(wss_ctlr) + "/sdwan/{}/api/ws" \
+                          "".format(api_version)
+
+    prisma_sase.api_logger.debug("URL = %s", url)
+    return self.websocket_call(url)
+
+# To use these monkeypatched functions:
+# import prisma_sase
+# import sasecli_lib
+# sdk = prisma_sase.API()
+# client_id = '<client_id here>'
+# client_secret = '<client_secret here>'
+# sdk.monkeypatch_generate_jwt = sasecli_lib.monkeypatch_generate_jwt
+# sdk.monkeypatch_interactive_login_secret = sasecli_lib.monkeypatch_interactive_login_secret
+# sdk.get.monkeypatch_tenant_service_groups = sasecli_lib.monkeypatch_get_tsg
+# sdk.monkeypatch_interactive_login_secret(sdk, client_id=client_id, client_secret=client_secret)
+# prisma_sase.jd(sdk.get.monkeypatch_tenant_service_groups(sdk))
+#
+# .. should pretty print JSON showing TSG's allowed for client_id
+#
+# The monkeypatched functions need SDK passed as first arg, because I don't know how to monkeypatch a class and maintain
+# the self reference. So you need to pass the "self" object (sdk) in as first arg "self".
+
+# -- End monkeypatch for prisma_sase SDK
 
 
 def sasecli_verbosity(verbose_level, set_format=None, set_handler=None):
@@ -967,84 +1034,64 @@ def pick_element(element_str, sdk):
     raise SasecliElementSelectionError(f"Element Selection Failure")
 
 
-def pick_client(client_string, sdk):
+def pick_tsg(tsg_string, sdk):
     """
     Get element ID and username from string.
-    :param client_string: string from arg or other
+    :param tsg_string: string from arg or other
     :param sdk: Logged in Prisma SASE SDK Constructor
     :return: element_id, user_name
     """
     # update client caches.
-    update_clients_cache(sdk)
+    update_tsg_cache(sdk)
 
-    client_name_list = [name for name in CLIENT_N2ID.keys()]
-    client_canonical_name_list = [name for name in CLIENT_CANONICAL_N2ID.keys()]
-    client_id_list = [idnum for idnum in CLIENT_ID2R.keys()]
-
-    # build inverted lookup dicts
-    client_id2n = {value: key for key, value in CLIENT_N2ID.items()}
-    client_canonical_id2n = {value: key for key, value in CLIENT_CANONICAL_N2ID.items()}
+    tsg_name_list = [name for name in TSG_N2ID.keys()]
+    tsg_id_list = [idnum for idnum in TSG_ID2N.keys()]
 
     # fuzzy match
-    possibilities = process.extract(client_string, client_name_list + client_canonical_name_list + client_id_list,
+    possibilities = process.extract(tsg_string, tsg_name_list + tsg_id_list,
                                     limit=7)
     first_choice, first_percent = possibilities[0]
 
-    client_id = None
-    client_name = None
-    client_canonical_name = None
+    tsg_id = None
+    tsg_name = None
 
     # perfect match, just get..
     if first_percent == 100:
-        if first_choice in client_name_list:
-            client_id = CLIENT_N2ID.get(first_choice)
-            client_name = first_choice
-            client_canonical_name = client_canonical_id2n.get(CLIENT_N2ID.get(first_choice, {}))
-        elif first_choice in client_canonical_name_list:
-            client_id = CLIENT_CANONICAL_N2ID.get(first_choice)
-            client_name = client_id2n.get(CLIENT_CANONICAL_N2ID.get(first_choice, {}))
-            client_canonical_name = first_choice
+        if first_choice in tsg_name_list:
+            tsg_id = TSG_N2ID.get(first_choice)
+            tsg_name = first_choice
         else:
-            # has to be client_id
-            client_id = first_choice
-            client_name = client_id2n.get(first_choice)
-            client_canonical_name = client_canonical_id2n.get(first_choice)
+            # has to be tsg_id
+            tsg_id = first_choice
+            client_name = TSG_ID2N.get(first_choice)
 
-        sasecli_logger.debug(f"Matched client {client_name} ({client_canonical_name}, ID: {client_id}, "
-                             f"Region: {CLIENT_ID2R.get(client_id)})")
+        sasecli_logger.debug(f"Matched client {tsg_name} (ID: {tsg_id})")
 
     # good guess match..
     elif first_percent >= 95:
-        sys.stdout.write(f"No match for client {client_string}. Close match in {first_choice}, use that? (y/n):")
+        sys.stdout.write(f"No match for client {tsg_string}. Close match in {first_choice}, use that? (y/n):")
         sys.stdout.flush()
         yesno = getch()
         sys.stdout.write(yesno)
         sys.stdout.flush()
         if yesno.lower() == 'y':
-            if first_choice in client_name_list:
-                client_id = CLIENT_N2ID.get(first_choice)
-                client_name = first_choice
-                client_canonical_name = client_canonical_id2n.get(CLIENT_N2ID.get(first_choice, {}))
-            elif first_choice in client_canonical_name_list:
-                client_id = CLIENT_CANONICAL_N2ID.get(first_choice)
-                client_name = client_id2n.get(CLIENT_CANONICAL_N2ID.get(first_choice, {}))
-                client_canonical_name = first_choice
+            if first_choice in tsg_name_list:
+                tsg_id = TSG_N2ID.get(first_choice)
+                tsg_name = first_choice
             else:
-                # has to be client_id
-                client_id = first_choice
-                client_name = client_id2n.get(first_choice)
-                client_canonical_name = client_canonical_id2n.get(first_choice)
+                # has to be tsg_id
+                tsg_id = first_choice
+                client_name = TSG_ID2N.get(first_choice)
 
-            sasecli_logger.debug(f"Matched client {client_name} ({client_canonical_name}, ID: {client_id}, "
-                                 f"Region: {CLIENT_ID2R.get(client_id)})")
+            sasecli_logger.debug(f"Matched client {tsg_name} (ID: {tsg_id})")
 
         # No else, if 'n', will display a list to try and get a better match.
 
     # if client ID not set, have not found a direct or acceptable slightly-fuzzy match. Give a list.
-    if client_id is None:
+    if tsg_id is None:
 
         # No close match, or close match wrong. Ask a list...
-        sys.stdout.write(f"No match for {client_string}, best guesses:\n")
+        sys.stdout.write(f"No match for {tsg_string}, best guesses:\n")
         index = 1
         for choice, percent in possibilities:
             sys.stdout.write(f"  {index}) {choice}, ({percent}%)\n")
@@ -1057,342 +1104,320 @@ def pick_client(client_string, sdk):
         if picked_index.isdigit() and 1 <= int(picked_index) <= len(possibilities):
             # pull the tuple out - index is one more than the list index.
             selected_choice, selected_percent = possibilities[int(picked_index) - 1]
-            if selected_choice in client_name_list:
-                client_id = CLIENT_N2ID.get(selected_choice)
-                client_name = selected_choice
-                client_canonical_name = client_canonical_id2n.get(CLIENT_N2ID.get(selected_choice, {}))
-            elif selected_choice in client_canonical_name_list:
-                client_id = CLIENT_CANONICAL_N2ID.get(selected_choice)
-                client_name = client_id2n.get(CLIENT_CANONICAL_N2ID.get(selected_choice, {}))
-                client_canonical_name = selected_choice
+            if selected_choice in tsg_name_list:
+                tsg_id = TSG_N2ID.get(selected_choice)
+                tsg_name = selected_choice
             else:
-                # has to be client_id
-                client_id = selected_choice
-                client_name = client_id2n.get(selected_choice)
-                client_canonical_name = client_canonical_id2n.get(selected_choice)
+                # has to be tsg_id
+                tsg_id = selected_choice
+                client_name = TSG_ID2N.get(selected_choice)
 
-            sasecli_logger.debug(f"Matched client {client_name} ({client_canonical_name}, ID: {client_id}, "
-                                 f"Region: {CLIENT_ID2R.get(client_id)})")
+            sasecli_logger.debug(f"Matched client {tsg_name} (ID: {tsg_id})")
 
         else:
-            raise SasecliControllerClientLoginError(f"No match for {client_string} found.")
+            raise SasecliControllerClientLoginError(f"No match for {tsg_string} found.")
 
     # got here, client was picked.
-    return client_id, client_name, client_canonical_name
+    return tsg_id, tsg_name
 
 
-def cgx_client_login_minimal(sdk, chosen_client_id):
+def tsg_switch_minimal(sdk, chosen_tsg_id):
     """
-    Reimplementation of interactive.client_login from CloudGenix Python SDK 5.2.1 - to login with just client_id.
+    Reimplementation of interactive.login_secret from Prisma SASE SDK - to login with just tsg_id
     :param sdk: Logged in Prisma SASE SDK Constructor
-    :param chosen_client_id: ID of ESP Client.
+    :param chosen_tsg_id: ID of TSG
     :return: Boolean: True if successful.
     """
 
-    clogin_resp = sdk.post.clients_login(chosen_client_id, {})
+    tsg_login_resp = sdk.interactive.login_secret(client_id=sdk.client_id, client_secret=sdk.client_secret,
+                                                  tsg_id=chosen_tsg_id)
 
-    if clogin_resp.cgx_status:
-        # see if we need to change regions.
-        redirect_region = clogin_resp.cgx_content.get('redirect_region')
-        redirect_x_auth_token = clogin_resp.cgx_content.get('redirect_x_auth_token')
-        redirect_urlpath = clogin_resp.cgx_content.get('redirect_urlpath')
+    if tsg_login_resp:
+        return True
 
-        if redirect_region is not None and redirect_x_auth_token is not None:
-            sasecli_logger.debug('CLIENT REGION SWITCH: %s -> %s', sdk.controller_region,
-                                 redirect_region)
-            # Need to change regions.
-            sdk.update_region_to_controller(redirect_region)
-
-            # Now set a temporary X-Auth-Token header, overwriting previous if there.
-            # if using a static AUTH_TOKEN, client login will switch to dynamic via
-            # Cookies.
-            sdk.add_headers({'X-Auth-Token': redirect_x_auth_token})
-
-        # login successful, update profile
-
-        # Profile call will set new login cookies if switching regions.
-        c_profile = sdk.interactive.update_profile_vars()
-        if redirect_region is not None and redirect_x_auth_token is not None:
-            # if region switch, we need to clear the X-Auth-Token header, as it was a temporary value
-            # and now we are using cookies for ephemeral AUTH_TOKENs.
-            sdk.remove_header('X-Auth-Token')
-
-        # Update tenant info.
-        t_profile = sdk.interactive.tenant_update_vars()
-
-        if c_profile and t_profile:
-            # remove referer header prior to continuing.
-            sdk.remove_header('Referer')
-            return True
-
-        else:
-            # remove referer header prior to continuing.
-            sdk.remove_header('Referer')
-            raise SasecliControllerClientLoginError(f"Client Login to ID {chosen_client_id} failed. "
-                                                    f"(unable to retrieve Client Profile(s))")
     else:
         # remove referer header prior to continuing.
         sdk.remove_header('Referer')
-        raise SasecliControllerClientLoginError(f"Client Login to ID {chosen_client_id} failed.")
+        raise SasecliControllerClientLoginError(f"TSG Login to ID {chosen_tsg_id} failed.")
 
 
 def sase_sdk_login(args):
-    return
-#
-# def sase_sdk_login(args):
-#     """
-#     Function to handle SDK login, hook and load config file, and also update some globle CGX object caches.
-#     :param args: argparse object with arguments
-#     :return: tuple of (Logged-in Prisma SASE SDK, element ID, device toolkit username, device toolkit password)
-#     """
-#
-#     # Build SDK Constructor
-#     if args['endpoint'] and args['insecure']:
-#         sasecli_logger.debug(f"Using ENDPOINT: {args['endpoint']}, SSL_VERIFY: {False}")
-#         sdk = prisma_sase.API(controller=args['endpoint'], ssl_verify=False)
-#     elif args['endpoint']:
-#         sasecli_logger.debug(f"Using ENDPOINT: {args['endpoint']}, SSL_VERIFY: {True}")
-#         sdk = prisma_sase.API(controller=args['endpoint'])
-#     elif args['insecure']:
-#         sasecli_logger.debug(f"Using SSL_VERIFY: {False}")
-#         sdk = prisma_sase.API(ssl_verify=False)
-#     else:
-#         sdk = prisma_sase.API()
-#
-#     # monkeypatch the sdk with a TSG_ID not-required jwt function:
-#     sdk.notsg_generate_jwt = monkeypatch_generate_jwt
-#
-#     # check for region ignore
-#     if args['ignore_region']:
-#         sasecli_logger.debug(f"Using IGNORE_REGION: {True}")
-#         sdk.ignore_region = True
-#
-#     # check for force hosts.
-#     if args['force_host']:
-#         sasecli_logger.debug(f"Forcing HOST header to : {args['force_host']}")
-#         sdk.add_headers({"Host": args['force_host']})
-#         sdk.websocket_add_headers({"Host": args['force_host']})
-#
-#     # SDK debug, default = 0. Can be set also by command shell. Set from GLOBAL (set by main func).
-#     # 0 = logger handlers removed, critical only
-#     # 1 = logger info messages
-#     # 2 = logger debug messages.
-#     # 3 = logger debug + URLLIB3 messages.
-#     sasecli_logger.debug(f"Prisma SASE SDK DEBUG set to : {SDKDEBUG_LEVEL}")
-#     sdk.set_debug(SDKDEBUG_LEVEL)
-#
-#     # handle config loading defaults
-#     loaded_client_id = None
-#     loaded_client_secret = None
-#     loaded_device_user = None
-#     loaded_device_password = None
-#     loaded_msp_dict = {}
-#
-#     # try to load config items
-#     if isinstance(LOADED_CONFIG, dict):
-#         default_config = LOADED_CONFIG.get('DEFAULT')
-#         if default_config and isinstance(default_config, dict):
-#             loaded_client_id = default_config.get('CLIENT_ID')
-#             loaded_client_secret = default_config.get('CLIENT_SECRET')
-#             loaded_device_user = default_config.get('DEVICE_USER')
-#             loaded_device_password = default_config.get('DEVICE_PASSWORD')
-#         else:
-#             sasecli_logger.debug(f"Cannot read 'DEFAULT' Config key: {type(default_config)}")
-#         loaded_msp_dict = LOADED_CONFIG.get("MSP")
-#
-#     else:
-#         sasecli_logger.debug(f"Config corrupt, root not in dictionary format: {type(LOADED_CONFIG)}")
-#
-#     loaded_str = ""
-#     loaded_str += "GLOBAL client_id, " if loaded_client_id else ""
-#     loaded_str += "GLOBAL client_secret, " if loaded_client_secret else ""
-#     loaded_str += "GLOBAL device_user, " if loaded_device_user else ""
-#     loaded_str += "GLOBAL device_password, " if loaded_device_password else ""
-#     loaded_str += "initial MSP config, " if loaded_msp_dict else ""
-#
-#     if loaded_str:
-#         sasecli_logger.debug(f"Loaded the following items from config file: {loaded_str}")
-#
-#     # login logic. Use cmdline if set, use AUTH_TOKEN next, finally user/pass from config file, then prompt.
-#     # figure out user
-#     if args["client_id"]:
-#         client_id = args["client_id"]
-#         client_id_from = "commandline arguments"
-#     elif loaded_client_id:
-#         client_id = loaded_client_id
-#         client_id_from = "Configuration File DEFAULT section, CLIENT_ID"
-#     else:
-#         client_id = None
-#         client_id_from = None
-#
-#     # figure out secret
-#     if args["client_secret"]:
-#         client_secret = args["client_secret"]
-#         client_secret_from = "commandline arguments"
-#     elif loaded_client_secret:
-#         client_secret = loaded_client_secret
-#         client_secret_from = "Configuration File DEFAULT section, CLIENT_SECRET"
-#     else:
-#         client_secret = None
-#         client_secret_from = None
-#
-#     # parse element @ tsg string
-#     element_string = args['element[@tsg]']
-#     element_tsg = element_string.rsplit('@', 1)
-#     if len(element_tsg) == 1:
-#         # just element
-#         element = element_tsg[0]
-#         tsg = None
-#     else:
-#         # host and user
-#         element = element_tsg[0]
-#         tsg = element_tsg[1]
-#
-#     sasecli_logger.debug(f"Logging in to endpoint with Client ID/Client Secret. "
-#                          f"Client ID from: {client_id_from},"
-#                          f" Client Secret from: {client_secret_from}.")
-#
-#     retry = 0
-#
-#     # this function should be using sdk.interactive.login_secret() - but prisma_sase doesn't
-#     # support no TSG login - once fixed refactor this.
-#
-#
-#     while sdk.tenant_id is None and retry < 3:
-#         prisma_sase.interactive.Interactive
-#         sdk.interactive.login(controller_email, controller_password, client_login=False)
-#         # clear after one failed login, force manual login.
-#         if not sdk.tenant_id:
-#             sasecli_logger.debug(f"Endpoint login FAIL. tenant_id: {sdk.tenant_id}, "
-#                                  f"retry count: {retry}.")
-#             controller_email = None
-#             controller_password = None
-#             retry += 1
-#
-#     # see if login worked
-#     if not sdk.tenant_id:
-#         raise SasecliControllerLoginError(f"Login failed after {retry} attempts. "
-#                                           f"Stopping to prevent account lockout.")
-#
-#
-#
-#     # Check to see if we need to do Client Login, and figure out config file user(s) and password(s)
-#     esp_loaded_device_user = None
-#     esp_loaded_device_password = None
-#     loaded_client_config_value = None
-#     if sdk.is_esp and client:
-#         # update caches.
-#         sasecli_logger.debug(f"In ESP, attempting to log into client {client}")
-#         client_id, client_name, client_canonical_name = pick_client(client, sdk)
-#
-#         # manually log in to client to save time. Interactive re-pulls client list which can take multiple seconds.
-#         sys.stdout.write(f"\nConnecting to Client {client_name} ({client_canonical_name}).\n")
-#         sys.stdout.flush()
-#         client_login_status = cgx_client_login_minimal(sdk, client_id)
-#         sasecli_logger.debug(f"Client Login to {client} successful")
-#         # attempt to get ESP specific device credentials from config file.
-#
-#         if isinstance(loaded_esp_dict, dict):
-#
-#             # check ID, then canonical name, then name.
-#             if client_id in loaded_esp_dict.keys():
-#                 # client ID matches a key
-#                 loaded_client_config = loaded_esp_dict.get(client_id)
-#                 loaded_client_config_using = "Client ID"
-#                 loaded_client_config_value = client_id
-#                 sasecli_logger.debug(f"Loaded ESP section config from '{loaded_client_config_value}', "
-#                                      f"matched {loaded_client_config_using}.")
-#             elif client_canonical_name in loaded_esp_dict.keys():
-#                 # canonical name matches a key
-#                 loaded_client_config = loaded_esp_dict.get(client_canonical_name)
-#                 loaded_client_config_using = "Client Canonical Name"
-#                 loaded_client_config_value = client_canonical_name
-#                 sasecli_logger.debug(f"Loaded ESP section config from '{loaded_client_config_value}', "
-#                                      f"matched {loaded_client_config_using}.")
-#             elif client_name in loaded_esp_dict.keys():
-#                 # canonical name matches a key
-#                 loaded_client_config = loaded_esp_dict.get(client_name)
-#                 loaded_client_config_using = "Client Name"
-#                 loaded_client_config_value = client_name
-#                 sasecli_logger.debug(f"Loaded ESP section config from '{loaded_client_config_value}', "
-#                                      f"matched {loaded_client_config_using}.")
-#             else:
-#                 loaded_client_config = None
-#                 loaded_client_config_using = None
-#                 loaded_client_config_value = None
-#                 sasecli_logger.debug(f"No ESP section config found for {client_id}, {client_canonical_name} "
-#                                      f"or {client_name}.")
-#
-#             # did we load something?
-#             if loaded_client_config:
-#                 # check what we loaded
-#                 if isinstance(loaded_client_config, dict):
-#                     esp_loaded_device_user = loaded_client_config.get('DEVICE_USER')
-#                     esp_loaded_device_password = loaded_client_config.get('DEVICE_PASSWORD')
-#                 else:
-#                     sasecli_logger.debug(f"Cannot read '{loaded_client_config_value}' ESP section "
-#                                          f"config key, not dictionary: {type(loaded_client_config)}")
-#
-#         else:
-#             sasecli_logger.debug(f"Config ESP section key corrupt, not in dictionary format: {type(loaded_esp_dict)}")
-#
-#     elif client and not sdk.is_esp:
-#         # client specified, but not ESP session. Ignore.
-#         sys.stdout.write(f"Client @{client} specified, but not connected to ESP/MSP account. Ignoring.\n")
-#         sys.stdout.flush()
-#
-#     elif sdk.is_esp and not client:
-#         # ESP/MSP account but no client specified..
-#         raise SasecliControllerLoginError(f"Logged in to ESP/MSP account, but no @client specified. Client"
-#                                           f" is required for ESP/MSP accounts.")
-#
-#     # ok, if we got this far - we are logged into client, and we may or may not have device username/password loaded.
-#     if args['device_user'] is not None:
-#         sasecli_logger.debug(f"Loaded Device User from commandline argument: "
-#                              f"{args['device_user']}")
-#         return_user = args['device_user']
-#     elif esp_loaded_device_user is not None:
-#         sasecli_logger.debug(f"Loaded Device User from ESP section config '{loaded_client_config_value}': "
-#                              f"{esp_loaded_device_user}")
-#         return_user = esp_loaded_device_user
-#     elif loaded_device_user is not None:
-#         sasecli_logger.debug(f"Loaded Device User from DEFAULT config: {loaded_device_user}")
-#         return_user = loaded_device_user
-#     else:
-#         sasecli_logger.debug(f"Device User not loaded. Will prompt")
-#         return_user = None
-#
-#     if args['device_password'] is not None:
-#         sasecli_logger.debug(f"Loaded Device Password from commandline argument: "
-#                              f"<Sensitive value hidden>")
-#         return_password = args['device_password']
-#     elif esp_loaded_device_password is not None:
-#         sasecli_logger.debug(f"Loaded Device Password from ESP section config '{loaded_client_config_value}': "
-#                              f"<Sensitive value hidden>")
-#         return_password = esp_loaded_device_password
-#     elif loaded_device_password is not None:
-#         sasecli_logger.debug(f"Loaded Device Password from DEFAULT config: <Sensitive value hidden>")
-#         return_password = loaded_device_password
-#     else:
-#         sasecli_logger.debug(f"Device Password not loaded. Will prompt")
-#         return_password = None
-#
-#     # return the SDK constructor and element_name, device login and device password.
-#     return sdk, element, return_user, return_password
-#
-
-def update_clients_cache(sdk):
     """
-    Update the ESP/MSP client global name->ID caches and id->region cache.
+    Function to handle SDK login, hook and load config file, and also update some globle CGX object caches.
+    :param args: argparse object with arguments
+    :return: tuple of (Logged-in Prisma SASE SDK, element ID, device toolkit username, device toolkit password)
+    """
+
+    # Build SDK Constructor
+    if args['endpoint'] and args['insecure']:
+        sasecli_logger.debug(f"Using ENDPOINT: {args['endpoint']}, SSL_VERIFY: {False}")
+        sdk = prisma_sase.API(controller=args['endpoint'], ssl_verify=False)
+    elif args['endpoint']:
+        sasecli_logger.debug(f"Using ENDPOINT: {args['endpoint']}, SSL_VERIFY: {True}")
+        sdk = prisma_sase.API(controller=args['endpoint'])
+    elif args['insecure']:
+        sasecli_logger.debug(f"Using SSL_VERIFY: {False}")
+        sdk = prisma_sase.API(ssl_verify=False)
+    else:
+        sdk = prisma_sase.API()
+
+    # check for region ignore
+    if args['ignore_region']:
+        sasecli_logger.debug(f"Using IGNORE_REGION: {True}")
+        sdk.ignore_region = True
+
+    # check for force hosts.
+    if args['force_host']:
+        sasecli_logger.debug(f"Forcing HOST header to : {args['force_host']}")
+        sdk.add_headers({"Host": args['force_host']})
+        sdk.websocket_add_headers({"Host": args['force_host']})
+
+    # SDK debug, default = 0. Can be set also by command shell. Set from GLOBAL (set by main func).
+    # 0 = logger handlers removed, critical only
+    # 1 = logger info messages
+    # 2 = logger debug messages.
+    # 3 = logger debug + URLLIB3 messages.
+    sasecli_logger.debug(f"Prisma SASE SDK DEBUG set to : {SDKDEBUG_LEVEL}")
+    sdk.set_debug(SDKDEBUG_LEVEL)
+
+    # handle config loading defaults
+    loaded_client_id = None
+    loaded_client_secret = None
+    loaded_device_user = None
+    loaded_device_password = None
+    loaded_msp_dict = {}
+
+    # try to load config items
+    if isinstance(LOADED_CONFIG, dict):
+        default_config = LOADED_CONFIG.get('DEFAULT')
+        if default_config and isinstance(default_config, dict):
+            loaded_client_id = default_config.get('CLIENT_ID')
+            loaded_client_secret = default_config.get('CLIENT_SECRET')
+            loaded_device_user = default_config.get('DEVICE_USER')
+            loaded_device_password = default_config.get('DEVICE_PASSWORD')
+        else:
+            sasecli_logger.debug(f"Cannot read 'DEFAULT' Config key: {type(default_config)}")
+        loaded_msp_dict = LOADED_CONFIG.get("MSP")
+
+    else:
+        sasecli_logger.debug(f"Config corrupt, root not in dictionary format: {type(LOADED_CONFIG)}")
+
+    loaded_str = ""
+    loaded_str += "GLOBAL client_id, " if loaded_client_id else ""
+    loaded_str += "GLOBAL client_secret, " if loaded_client_secret else ""
+    loaded_str += "GLOBAL device_user, " if loaded_device_user else ""
+    loaded_str += "GLOBAL device_password, " if loaded_device_password else ""
+    loaded_str += "initial MSP config, " if loaded_msp_dict else ""
+
+    if loaded_str:
+        sasecli_logger.debug(f"Loaded the following items from config file: {loaded_str}")
+
+    # login logic. Use cmdline if set, use AUTH_TOKEN next, finally user/pass from config file, then prompt.
+    # figure out user
+    if args["client_id"]:
+        client_id = args["client_id"]
+        client_id_from = "commandline arguments"
+    elif loaded_client_id:
+        client_id = loaded_client_id
+        client_id_from = "Configuration File DEFAULT section, CLIENT_ID"
+    else:
+        client_id = None
+        client_id_from = None
+
+    # figure out secret
+    if args["client_secret"]:
+        client_secret = args["client_secret"]
+        client_secret_from = "commandline arguments"
+    elif loaded_client_secret:
+        client_secret = loaded_client_secret
+        client_secret_from = "Configuration File DEFAULT section, CLIENT_SECRET"
+    else:
+        client_secret = None
+        client_secret_from = None
+
+    # parse element @ tsg string
+    element_string = args['element[@tsg]']
+    element_tsg = element_string.rsplit('@', 1)
+    if len(element_tsg) == 1:
+        # just element
+        element = element_tsg[0]
+        tsg = None
+    else:
+        # host and user
+        element = element_tsg[0]
+        tsg = element_tsg[1]
+
+    sasecli_logger.debug(f"Logging in to endpoint with Client ID/Client Secret. "
+                         f"Client ID from: {client_id_from},"
+                         f" Client Secret from: {client_secret_from}.")
+
+    retry = 0
+
+    # this function should be using sdk.interactive.login_secret() - but prisma_sase doesn't
+    # support no TSG login - once fixed refactor this section, as we are monkeypatching the SDK.
+    sdk.monkeypatch_generate_jwt = monkeypatch_generate_jwt
+    sdk.monkeypatch_interactive_login_secret = monkeypatch_interactive_login_secret
+    sdk.get.monkeypatch_tenant_service_groups = monkeypatch_get_tsg
+
+    while sdk.tenant_id is None and retry < 3:
+        sdk.monkeypatch_interactive_login_secret(sdk, client_id=client_id, client_secret=client_secret)
+        # clear after one failed login, force manual login.
+        if not sdk.tenant_id:
+            sasecli_logger.debug(f"Endpoint login FAIL. tenant_id: {sdk.tenant_id}, "
+                                 f"retry count: {retry}.")
+            controller_email = None
+            controller_password = None
+            retry += 1
+
+    # see if login worked
+    if not sdk.tenant_id:
+        raise SasecliControllerLoginError(f"Login failed after {retry} attempts. "
+                                          f"Stopping to prevent account lockout.")
+
+    # Check to see if we need to do MSP Login, and figure out config file user(s) and password(s)
+    msp_loaded_device_user = None
+    msp_loaded_device_password = None
+    loaded_msp_config_value = None
+
+    if tsg:
+        # update caches.
+        sasecli_logger.debug(f"In MSP, attempting to log into tsg {tsg}")
+        tsg_id, tsg_name = pick_tsg(tsg, sdk)
+
+        # manually log in to client to save time. Interactive re-pulls client list which can take multiple seconds.
+        sys.stdout.write(f"\nSwitching to TSG {tsg_name}.\n")
+        sys.stdout.flush()
+        tsg_login_status = tsg_switch_minimal(sdk, tsg_id)
+        sasecli_logger.debug(f"Switch to TSG {tsg_name} successful")
+        # attempt to get ESP specific device credentials from config file.
+
+        if isinstance(loaded_msp_dict, dict):
+
+            # check ID, then canonical name, then name.
+            if tsg_id in loaded_msp_dict.keys():
+                # client ID matches a key
+                loaded_tsg_config = loaded_msp_dict.get(tsg_id)
+                loaded_tsg_config_using = "TSG ID"
+                loaded_msp_config_value = tsg_id
+                sasecli_logger.debug(f"Loaded MSP section config from '{loaded_msp_config_value}', "
+                                     f"matched {loaded_tsg_config_using}.")
+            elif tsg_name in loaded_msp_dict.keys():
+                # canonical name matches a key
+                loaded_tsg_config = loaded_msp_dict.get(tsg_name)
+                loaded_tsg_config_using = "TSG Name"
+                loaded_msp_config_value = tsg_id
+                sasecli_logger.debug(f"Loaded MSP section config from '{loaded_msp_config_value}', "
+                                     f"matched {loaded_tsg_config_using}.")
+            else:
+                loaded_tsg_config = None
+                loaded_tsg_config_using = None
+                loaded_msp_config_value = None
+                sasecli_logger.debug(f"No ESP section config found for {tsg_id} "
+                                     f"or {tsg_name}.")
+
+            # did we load something?
+            if loaded_tsg_config:
+                # check what we loaded
+                if isinstance(loaded_tsg_config, dict):
+                    msp_loaded_device_user = loaded_tsg_config.get('DEVICE_USER')
+                    msp_loaded_device_password = loaded_tsg_config.get('DEVICE_PASSWORD')
+                else:
+                    sasecli_logger.debug(f"Cannot read '{loaded_msp_config_value}' MSP section "
+                                         f"config key, not dictionary: {type(loaded_tsg_config)}")
+
+        else:
+            sasecli_logger.debug(f"Config MSP section key corrupt, not in dictionary format: {type(loaded_msp_dict)}")
+
+    # ok, if we got this far - we are logged into client, and we may or may not have device username/password loaded.
+    if args['device_user'] is not None:
+        sasecli_logger.debug(f"Loaded Device User from commandline argument: "
+                             f"{args['device_user']}")
+        return_user = args['device_user']
+    elif msp_loaded_device_user is not None:
+        sasecli_logger.debug(f"Loaded Device User from MSP section config '{loaded_msp_config_value}': "
+                             f"{msp_loaded_device_user}")
+        return_user = msp_loaded_device_user
+    elif loaded_device_user is not None:
+        sasecli_logger.debug(f"Loaded Device User from DEFAULT config: {loaded_device_user}")
+        return_user = loaded_device_user
+    else:
+        sasecli_logger.debug(f"Device User not loaded. Will prompt")
+        return_user = None
+
+    if args['device_password'] is not None:
+        sasecli_logger.debug(f"Loaded Device Password from commandline argument: "
+                             f"<Sensitive value hidden>")
+        return_password = args['device_password']
+    elif msp_loaded_device_password is not None:
+        sasecli_logger.debug(f"Loaded Device Password from ESP section config '{loaded_msp_config_value}': "
+                             f"<Sensitive value hidden>")
+        return_password = msp_loaded_device_password
+    elif loaded_device_password is not None:
+        sasecli_logger.debug(f"Loaded Device Password from DEFAULT config: <Sensitive value hidden>")
+        return_password = loaded_device_password
+    else:
+        sasecli_logger.debug(f"Device Password not loaded. Will prompt")
+        return_password = None
+
+    # return the SDK constructor and element_name, device login and device password.
+    return sdk, element, return_user, return_password
+
+
+def update_tsg_cache(sdk):
+    """
+    Update the MSP tsg global name->ID cache
     :param sdk: Logged in Prisma SASE SDK Constructor
     :return: Boolean: True if successful.
     """
-    global CLIENT_N2ID
-    global CLIENT_CANONICAL_N2ID
-    global CLIENT_ID2R
-    sasecli_logger.debug("Updating ESP/MSP Client Cache.")
-    session_status, CLIENT_N2ID, CLIENT_CANONICAL_N2ID, CLIENT_ID2R = sdk.interactive.session_allowed_clients()
-    return session_status
+    global TSG_N2ID
+    global TSG_ID2N
+    sasecli_logger.debug("Updating TSG Cache.")
+
+    # Make API requests
+    tsgs_resp = sdk.get.monkeypatch_tenant_service_groups(sdk)
+    tsg_status = tsgs_resp.sdk_status
+    tsgs_dict = tsgs_resp.sdk_content
+
+    # Build MSP id-name dict, get list of allowed tenants.
+    if tsg_status:
+        # Client maps, name to ID, Canonical Name to ID, and ID to Region.
+        tsg_id2n = {}
+        tsg_n2id = {}
+        tsg_names_list = []
+        for tsg_entry in tsgs_dict.get('items', []):
+            if type(tsg_entry) is dict:
+                # create client ID to name map table.
+                tsg_id = tsg_entry.get('id', "err")
+                tsg_name = tsg_entry.get('display_name', "")
+                # update tsg id2n and make list of tsg display names
+                tsg_id2n[tsg_id] = tsg_name
+                tsg_names_list.append(tsg_name)
+
+        # since display names in tsgs can be duplicates, we will only create name -> ID mappings of TSGs that are
+        # not duplicates. If you have dups - you need to reference TSG by ID and not display_name.
+        unique_tsg_names = set(tsg_names_list)
+        duplicate_tsg_names = [name for name in tsg_names_list if name not in unique_tsg_names]
+
+        # re-iterate and only make n2id for non-duplicate names
+        for tsg_entry in tsgs_dict.get('items', []):
+            if type(tsg_entry) is dict:
+                # create client ID to name map table.
+                tsg_id = tsg_entry.get('id', "err")
+                tsg_name = tsg_entry.get('display_name', "")
+                if tsg_name not in duplicate_tsg_names:
+                    tsg_n2id[tsg_name] = tsg_id
+
+        # update cache, return true
+        TSG_ID2N = tsg_id2n
+        TSG_N2ID = tsg_n2id
+        return True
+
+    else:
+        # Could not get a specific API response.
+        sasecli_logger.debug("API request failure. Response status - tenant_service_groups: %s",
+                             sdk.sdk_status)
+        return False
+
 
 
 def update_elements_cache(sdk):
@@ -1478,7 +1503,11 @@ async def generic_worker(loop, input_queue, stop_future, sdk, pretty_print=True,
         termsize_tuple = os.get_terminal_size()
         columns = termsize_tuple[0]
         rows = termsize_tuple[1]
-        websocket = await sdk.ws.default()
+        # websocket = await sdk.ws.default()
+        # --start monkeypatch due to SDK bug - undo when fixed.
+        sdk.ws.monkeypatch_default = monkeypatch_default_ws
+        websocket = await sdk.ws.monkeypatch_default_ws(sdk)
+        # -- end monkeypatch
     except Exception as e:
         # failure, exit clean as possible. Some tasks end up hanging, should be canceled/exited in main thread.
         print_over_input(f"Failed to connect: {e}.")
@@ -1616,7 +1645,11 @@ async def toolkit_worker(loop, input_queue, stop_future, pause_queue, element_id
         termsize_tuple = os.get_terminal_size()
         columns = termsize_tuple[0]
         rows = termsize_tuple[1]
-        websocket = await sdk.ws.toolkit_session(element_id, cols=columns, rows=rows, close_timeout=1)
+        # websocket = await sdk.ws.toolkit_session(element_id, cols=columns, rows=rows, close_timeout=1)
+        # --start monkeypatch due to SDK bug - undo when fixed.
+        sdk.ws.monkeypatch_toolkit_session = monkeypatch_toolkit_session
+        websocket = await sdk.ws.monkeypatch_toolkit_session(sdk, element_id, cols=columns, rows=rows, close_timeout=1)
+        # -- end monkeypatch
     except Exception as e:
         # failure, exit clean as possible. Some tasks end up hanging, should be canceled/exited in main thread.
         print_over_input(f"Failed to connect to {element_id}: {e}.")

@@ -2,7 +2,8 @@
 Command-line access to available Prisma SASE CLI resources. (Specifically, Prisma SD-WAN as of now.)
 
 #### Synopsis
-This is a placeholder for the soon-to-be released utility. 
+In development utility to allow commandline access to Prisma SASE CLI resources. A few bugs exist as of now,
+will update this README.md when actually released
 
 #### Requirements
 * Active Prisma SASE Account
@@ -10,11 +11,11 @@ This is a placeholder for the soon-to-be released utility.
 * Prisma SD-WAN IONs running 5.2.1+ Software
 * Python modules:
     * prisma_sase   - <https://github.com/PaloAltoNetworks/prisma-sase-sdk-python>
-    * websockets   - <https://websockets.readthedocs.io/en/stable/>
-    * fuzzywuzzy   - <https://github.com/seatgeek/fuzzywuzzy/>
-    * pyyaml       - <https://pyyaml.org/wiki/PyYAMLDocumentation>
-    * tabulate     - <https://github.com/astanin/python-tabulate>
-    * cryptography - <https://github.com/pyca/cryptography>
+    * websockets    - <https://websockets.readthedocs.io/en/stable/>
+    * thefuzz       - <https://github.com/seatgeek/thefuzz/>
+    * pyyaml        - <https://pyyaml.org/wiki/PyYAMLDocumentation>
+    * tabulate      - <https://github.com/astanin/python-tabulate>
+    * cryptography  - <https://github.com/pyca/cryptography>
 
 #### Installation
 * Via PIP as simple as `pip install --upgrade sasecli`
